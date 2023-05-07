@@ -36,9 +36,15 @@ class GmailManager:
                 token.write(creds.to_json())
         return creds
 
+    def get_labels(self):
+        labels = self.service.users().labels().list(userId='me').execute().get('labels', [])
+        label_dict = {label['id']: label['name'] for label in labels}
+        return label_dict
+
     def fetch_emails(self, query=''):
         next_page_token = None
         emails = []
+        label_dict = self.get_labels()
 
         while True:
             result = self.service.users().messages().list(userId='me', q=query, pageToken=next_page_token).execute()
@@ -48,7 +54,7 @@ class GmailManager:
                 msg_data = self.service.users().messages().get(userId='me', id=msg['id'], format='full').execute()
                 payload = msg_data['payload']
                 headers = payload.get('headers')
-                subject, date, sender = None, None, None
+                subject, date, sender, labels = None, None, None, None
 
                 for header in headers:
                     header_name = header.get('name')
@@ -60,12 +66,15 @@ class GmailManager:
                     if header_name == 'From' or header_name == 'from':
                         sender = header_value
 
+                label_ids = msg_data.get('labelIds', [])
+                labels = [label_dict.get(label_id, label_id) for label_id in label_ids]
+
                 emails.append({
                     'id': msg['id'],
                     'subject': subject,
                     'date': date,
                     'from': sender,
-                    'labels': [label['name'] for label in payload.get('labels', [])],
+                    'labels': '; '.join(labels),
                 })
 
             next_page_token = result.get('nextPageToken')
@@ -74,6 +83,7 @@ class GmailManager:
 
         self.emails = pd.DataFrame(emails)
         return self.emails
+
 
 
     def move_to_folder(self, email_ids, folder_name):
