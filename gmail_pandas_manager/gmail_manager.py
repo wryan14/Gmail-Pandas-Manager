@@ -7,6 +7,9 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import base64
 
 SCOPES = ['https://mail.google.com/']
 
@@ -84,9 +87,7 @@ class GmailManager:
         self.emails = pd.DataFrame(emails)
         return self.emails
 
-
-
-    def move_to_folder(self, email_ids, folder_name):
+    def move_to_folder(self, email_df, folder_name):
         # Get the label ID for the folder
         folder = None
         labels = self.service.users().labels().list(userId='me').execute().get('labels', [])
@@ -99,29 +100,84 @@ class GmailManager:
             return
 
         # Modify the messages to move them to the folder
-        for email_id in email_ids:
+        for email_id in email_df['id'].tolist():
             try:
                 self.service.users().messages().modify(userId='me', id=email_id, body={'removeLabelIds': ['INBOX'], 'addLabelIds': [folder]}).execute()
             except HttpError as error:
                 print(f'An error occurred moving email ID {email_id}: {error}')
 
-    def delete_emails(self, email_ids):
-        for email_id in email_ids:
+
+    def delete_emails(self, email_df):
+        for email_id in email_df['id'].tolist():
             try:
                 self.service.users().messages().delete(userId='me', id=email_id).execute()
             except HttpError as error:
                 print(f'An error occurred deleting email ID {email_id}: {error}')
 
+    def create_message(self, to, subject, message_text):
+        """Create a message for an email.
 
-if __name__=="__main__":
-    gm = GmailManager()
+        Args:
+            to: Email address of the receiver.
+            subject: The subject of the email message.
+            message_text: The text of the email message.
 
-    # Fetch emails and display them as a DataFrame
-    emails_df = gm.fetch_emails()
-    print(emails_df)
+        Returns:
+            An object containing a base64url encoded email object.
+        """
+        message = MIMEText(message_text)
+        message['to'] = to
+        message['subject'] = subject
+        encoded_message = base64.urlsafe_b64encode(message.as_bytes())
+        return {'raw': encoded_message.decode()}
 
-    # # Move emails with specific IDs to a folder (e.g., 'Label_1')
-    # gm.move_to_folder(['EMAIL_ID_1', 'EMAIL_ID_2'], 'Label_1')
+    def get_email_body(self, email_id):
+        """Get the body of a specific email by its ID."""
+        message = self.service.users().messages().get(userId='me', id=email_id, format='full').execute()
 
-    # # Delete emails with specific IDs
-    # gm.delete_emails(['EMAIL_ID_3', 'EMAIL_ID_4'])
+        try:
+            body = message['payload']['parts'][0]['body']['data']
+        except (KeyError, IndexError):
+            try:
+                body = message['payload']['body']['data']
+            except (KeyError, IndexError):
+                body = ""
+
+        if not body:
+            return ""
+        else:
+            text = base64.urlsafe_b64decode(body).decode('utf-8')
+            return text
+    
+    def send_message(self, user_id, message):
+        """Send an email message.
+
+        Args:
+            user_id: User's email address. The special value "me" can be used to indicate the authenticated user.
+            message: Message to be sent.
+
+        Returns:
+            Sent Message.
+        """
+        try:
+            message = (self.service.users().messages().send(userId=user_id, body=message).execute())
+            print('Message Id: %s' % message['id'])
+            return message
+        except HttpError as error:
+            print('An error occurred: %s' % error)
+
+    def combine_and_forward_emails(self, email_df, forward_to):
+        """Combine and forward emails to another email address."""
+        combined_body = ""
+
+        for _, email in email_df.iterrows():
+            combined_body += f"\n\n---------------------------------------------------\n"
+            combined_body += f"From: {email['from']}\n"
+            combined_body += f"Subject: {email['subject']}\n"
+            combined_body += f"Date: {email['date']}\n\n"
+            combined_body += f"{self.get_email_body(email['id'])}"
+
+        combined_body += "\n\n---------------------------------------------------\n"
+
+        message = self.create_message(forward_to, "Combined Emails", combined_body)
+        self.send_message('me', message)
