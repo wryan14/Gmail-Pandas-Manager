@@ -1,6 +1,7 @@
 import os
 import sys
 import base64
+import sqlite3
 import pandas as pd
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -9,7 +10,6 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-import base64
 
 SCOPES = ['https://mail.google.com/']
 
@@ -18,6 +18,22 @@ class GmailManager:
         self.creds = self.get_credentials()
         self.service = build('gmail', 'v1', credentials=self.creds)
         self.emails = None
+        self.label_dict = self.get_labels()  
+        self.conn = sqlite3.connect('emails.db')
+        self.cursor = self.conn.cursor()
+        self.create_table()
+
+    def create_table(self):
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS emails (
+                id TEXT PRIMARY KEY,
+                subject TEXT,
+                date TEXT,
+                sender TEXT,
+                labels TEXT
+            )
+        ''')
+        self.conn.commit()
 
     def get_credentials(self):
         creds = None
@@ -45,9 +61,15 @@ class GmailManager:
         return label_dict
 
     def fetch_emails(self, query=''):
+        try:
+            self.cursor.execute("SELECT MAX(date) FROM emails")
+            last_email_date = self.cursor.fetchone()[0]
+            if last_email_date is not None:
+                query += f' after:{last_email_date}'
+        except sqlite3.OperationalError:
+            pass
+
         next_page_token = None
-        emails = []
-        label_dict = self.get_labels()
 
         while True:
             result = self.service.users().messages().list(userId='me', q=query, pageToken=next_page_token).execute()
@@ -70,22 +92,38 @@ class GmailManager:
                         sender = header_value
 
                 label_ids = msg_data.get('labelIds', [])
-                labels = [label_dict.get(label_id, label_id) for label_id in label_ids]
+                labels = [self.label_dict.get(label_id, label_id) for label_id in label_ids]
 
-                emails.append({
+                email_data = {
                     'id': msg['id'],
                     'subject': subject,
                     'date': date,
                     'from': sender,
                     'labels': '; '.join(labels),
-                })
+                }
+
+                self.store_email(email_data)
 
             next_page_token = result.get('nextPageToken')
             if not next_page_token:
                 break
 
-        self.emails = pd.DataFrame(emails)
+        self.emails = self.get_emails_from_db()
         return self.emails
+
+    
+    def get_emails_from_db(self):
+        self.cursor.execute('SELECT * FROM emails')
+        rows = self.cursor.fetchall()
+        df = pd.DataFrame(rows, columns=['id', 'subject', 'date', 'sender', 'labels'])
+        return df
+
+    def store_email(self, email_data):
+        self.cursor.execute('''
+            INSERT OR IGNORE INTO emails (id, subject, date, sender, labels)
+            VALUES (:id, :subject, :date, :from, :labels)
+        ''', email_data)
+        self.conn.commit()
 
     def move_to_folder(self, email_df, folder_name):
         # Get the label ID for the folder
@@ -103,6 +141,19 @@ class GmailManager:
         for email_id in email_df['id'].tolist():
             try:
                 self.service.users().messages().modify(userId='me', id=email_id, body={'removeLabelIds': ['INBOX'], 'addLabelIds': [folder]}).execute()
+
+                # Update the email record in the database
+                with self.conn:
+                    self.conn.execute(f"UPDATE emails SET labels = '{folder_name}' WHERE id = '{email_id}'")
+
+            except HttpError as error:
+                print(f'An error occurred moving email ID {email_id}: {error}')
+
+
+        # Modify the messages to move them to the folder
+        for email_id in email_df['id'].tolist():
+            try:
+                self.service.users().messages().modify(userId='me', id=email_id, body={'removeLabelIds': ['INBOX'], 'addLabelIds': [folder]}).execute()
             except HttpError as error:
                 print(f'An error occurred moving email ID {email_id}: {error}')
 
@@ -111,8 +162,11 @@ class GmailManager:
         for email_id in email_df['id'].tolist():
             try:
                 self.service.users().messages().delete(userId='me', id=email_id).execute()
+                self.cursor.execute('DELETE FROM emails WHERE id = ?', (email_id,))
+                self.conn.commit()
             except HttpError as error:
                 print(f'An error occurred deleting email ID {email_id}: {error}')
+
 
     def create_message(self, to, subject, message_text):
         """Create a message for an email.
@@ -166,18 +220,18 @@ class GmailManager:
         except HttpError as error:
             print('An error occurred: %s' % error)
 
-    def combine_and_forward_emails(self, email_df, forward_to):
+    def combine_and_forward_emails(self, email_df, forward_to, subject):
         """Combine and forward emails to another email address."""
         combined_body = ""
 
         for _, email in email_df.iterrows():
             combined_body += f"\n\n---------------------------------------------------\n"
-            combined_body += f"From: {email['from']}\n"
+            combined_body += f"From: {email['sender']}\n"
             combined_body += f"Subject: {email['subject']}\n"
             combined_body += f"Date: {email['date']}\n\n"
             combined_body += f"{self.get_email_body(email['id'])}"
 
         combined_body += "\n\n---------------------------------------------------\n"
 
-        message = self.create_message(forward_to, "Combined Emails", combined_body)
+        message = self.create_message(forward_to, subject, combined_body)
         self.send_message('me', message)
